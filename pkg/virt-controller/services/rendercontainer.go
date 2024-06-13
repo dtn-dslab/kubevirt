@@ -97,6 +97,18 @@ func WithCapabilities(vmi *v1.VirtualMachineInstance) Option {
 	}
 }
 
+func WithNetAdminCapability() Option {
+	return func(renderer *ContainerSpecRenderer) {
+		if renderer.capabilities == nil {
+			renderer.capabilities = &k8sv1.Capabilities{
+				Add: []k8sv1.Capability{CAP_NET_ADMIN},
+			}
+		} else {
+			renderer.capabilities.Add = append(renderer.capabilities.Add, CAP_NET_ADMIN)
+		}
+	}
+}
+
 func WithDropALLCapabilities() Option {
 	return func(renderer *ContainerSpecRenderer) {
 		if renderer.capabilities == nil {

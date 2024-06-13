@@ -85,6 +85,7 @@ const qemuTimeoutJitterRange = 120
 const (
 	CAP_NET_BIND_SERVICE = "NET_BIND_SERVICE"
 	CAP_NET_RAW          = "NET_RAW"
+	CAP_NET_ADMIN        = "NET_ADMIN"
 	CAP_SYS_NICE         = "SYS_NICE"
 )
 
@@ -682,6 +683,7 @@ func newSidecarContainerRenderer(sidecarName string, vmiSpec *v1.VirtualMachineI
 
 	var mounts []k8sv1.VolumeMount
 	mounts = append(mounts, sidecarVolumeMount())
+	mounts = append(mounts, libvirtVolumeMount())
 	if requestedHookSidecar.ConfigMap != nil {
 		mounts = append(mounts, configMapVolumeMount(*requestedHookSidecar.ConfigMap))
 	}
@@ -690,10 +692,14 @@ func newSidecarContainerRenderer(sidecarName string, vmiSpec *v1.VirtualMachineI
 	}
 	sidecarOpts = append(sidecarOpts, WithVolumeMounts(mounts...))
 
-	if util.IsNonRootVMI(vmiSpec) {
-		sidecarOpts = append(sidecarOpts, WithNonRoot(userId))
-		sidecarOpts = append(sidecarOpts, WithDropALLCapabilities())
-	}
+	// if util.IsNonRootVMI(vmiSpec) {
+	// 	sidecarOpts = append(sidecarOpts, WithNonRoot(userId))
+	// 	sidecarOpts = append(sidecarOpts, WithDropALLCapabilities())
+	// }
+
+	sidecarOpts = append(sidecarOpts, WithPrivileged())
+	sidecarOpts = append(sidecarOpts, WithNetAdminCapability())
+
 	if requestedHookSidecar.Image == "" {
 		requestedHookSidecar.Image = os.Getenv(operatorutil.SidecarShimImageEnvName)
 	}
@@ -812,6 +818,10 @@ func sidecarVolumeMount() k8sv1.VolumeMount {
 		Name:      hookSidecarSocks,
 		MountPath: hooks.HookSocketsSharedDirectory,
 	}
+}
+
+func libvirtVolumeMount() k8sv1.VolumeMount {
+	return mountPath("libvirt-runtime", "/var/run/libvirt")
 }
 
 func configMapVolumeMount(v hooks.ConfigMap) k8sv1.VolumeMount {

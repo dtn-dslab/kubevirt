@@ -227,6 +227,14 @@ lint-metrics:
 	./hack/prom-metric-linter/metric_name_linter.sh --operator-name="kubevirt" --sub-operator-name="kubevirt" --metrics-file=metrics.json
 	rm metrics.json
 
+up:
+	kubectl apply -f _out/manifests/release/kubevirt-operator.yaml
+	kubectl apply -f _out/manifests/release/kubevirt-cr.yaml
+
+down:
+	kubectl delete -f _out/manifests/release/kubevirt-cr.yaml
+	kubectl delete -f _out/manifests/release/kubevirt-operator.yaml
+
 .PHONY: \
 	build-verify \
 	conformance \
@@ -264,4 +272,6 @@ lint-metrics:
 	fmt \
 	lint \
 	lint-metrics\
+	up \
+	down \
 	$(NULL)
