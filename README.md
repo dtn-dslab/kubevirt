@@ -63,6 +63,21 @@ Once you have the basics, you can learn more about how to run KubeVirt and its n
  * [KubeVirt blog](https://kubevirt.io/blogs/)
  * [KubeVirt Youtube channel](https://www.youtube.com/channel/UC2FH36TbZizw25pVT1P3C3g)
 
+## Kube-DTN support
+
+To fast deploy KubeVirt with Kube-DTN support, you can use the following command:
+
+```bash
+export DOCKER_PREFIX=harbor.sail.se.sjtu.edu.cn/kubevirt
+export DOCKER_TAG=kubedtn-0.3
+# Build Kubevirt
+make all
+# Deploy KubeVirt
+make up
+# Undeploy KubeVirt
+make down
+```
+
 ## To start developing KubeVirt
 
 To set up a development environment please read our
