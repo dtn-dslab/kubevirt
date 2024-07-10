@@ -204,19 +204,6 @@ var _ = Describe("VirtualMachine", func() {
 		})
 
 		// TODO: We need to make sure the action was triggered
-		shouldExpectGracePeriodPatched := func(expectedGracePeriod int64) {
-			patch := fmt.Sprintf(`{"spec":{"terminationGracePeriodSeconds": %d }}`, expectedGracePeriod)
-			virtFakeClient.PrependReactor("update", "virtualmachineinstance", func(action testing.Action) (handled bool, ret runtime.Object, err error) {
-				switch action := action.(type) {
-				case testing.PatchActionImpl:
-					Expect(action.Patch).To(Equal([]byte(patch)))
-				default:
-					Fail("Expected to see patch")
-				}
-				return false, nil, nil
-			})
-		}
-		// TODO: We need to make sure the action was triggered
 		shouldExpectVMIFinalizerRemoval := func() {
 			virtFakeClient.PrependReactor("update", "virtualmachineinstance", func(action testing.Action) (handled bool, ret runtime.Object, err error) {
 				switch action := action.(type) {
@@ -1158,7 +1145,7 @@ var _ = Describe("VirtualMachine", func() {
 			testutils.ExpectEvent(recorder, FailedDataVolumeImportReason)
 		})
 
-		It("should start VMI once DataVolumes are complete", func() {
+		DescribeTable("should start VMI once DataVolumes are complete", func(runStrategy v1.VirtualMachineRunStrategy) {
 			vm, _ := DefaultVirtualMachine(true)
 			vm.Spec.Template.Spec.Volumes = append(vm.Spec.Template.Spec.Volumes, v1.Volume{
 				Name: "test1",
@@ -1173,29 +1160,55 @@ var _ = Describe("VirtualMachine", func() {
 					Name: "dv1",
 				},
 			})
-
-			existingDataVolume, _ := watchutil.CreateDataVolumeManifest(virtClient, vm.Spec.DataVolumeTemplates[0], vm)
-
-			existingDataVolume.Namespace = "default"
-			existingDataVolume.Status.Phase = cdiv1.Succeeded
+			vm.Spec.Running = nil
+			vm.Spec.RunStrategy = &runStrategy
 
 			vm, err := virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Create(context.TODO(), vm, metav1.CreateOptions{})
 			Expect(err).To(Succeed())
-			addVirtualMachine(vm)
 
-			dataVolumeFeeder.Add(existingDataVolume)
+			shouldExpectDataVolumeCreation(vm.UID, map[string]string{"kubevirt.io/created-by": string(vm.UID)}, nil, kvpointer.P(0))
+
+			addVirtualMachine(vm)
 			sanityExecute(vm)
-			testutils.ExpectEvent(recorder, SuccessfulCreateVirtualMachineReason)
+			testutils.ExpectEvent(recorder, SuccessfulDataVolumeCreateReason)
+
+			_, err = virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Get(context.TODO(), vm.Name, metav1.GetOptions{})
+			Expect(err).To(MatchError(ContainSubstring("not found")))
+
+			dv, _ := watchutil.CreateDataVolumeManifest(virtClient, vm.Spec.DataVolumeTemplates[0], vm)
+			dv.Namespace = "default"
+			dv.Status.Phase = cdiv1.Succeeded
+
+			dataVolumeFeeder.Add(dv)
+			sanityExecute(vm)
+
+			Expect(virtFakeClient.Actions()).To(WithTransform(func(actions []testing.Action) []testing.Action {
+				var patchActions []testing.Action
+				for _, action := range actions {
+					if action.GetVerb() == "update" &&
+						action.GetResource().Resource == "virtualmachines" &&
+						action.GetSubresource() == "status" {
+						patchActions = append(patchActions, action)
+					}
+				}
+				return patchActions
+			}, Not(BeEmpty())))
 
 			vm, err = virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Get(context.TODO(), vm.Name, metav1.GetOptions{})
-			Expect(err).To(Succeed())
-			// TODO // expect update status is called
+			Expect(err).ToNot(HaveOccurred())
+
 			Expect(vm.Status.Created).To(BeFalse())
 			Expect(vm.Status.Ready).To(BeFalse())
 
 			_, err = virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Get(context.TODO(), vm.Name, metav1.GetOptions{})
 			Expect(err).ToNot(HaveOccurred())
-		})
+
+			testutils.ExpectEvent(recorder, SuccessfulCreateVirtualMachineReason)
+		},
+			Entry("with runStrategy set to Always", v1.RunStrategyAlways),
+			Entry("with runStrategy set to Once", v1.RunStrategyOnce),
+			Entry("with runStrategy set to RerunOnFailure", v1.RunStrategyRerunOnFailure),
+		)
 
 		It("should start VMI once DataVolumes (not templates) are complete", func() {
 
@@ -2563,16 +2576,19 @@ var _ = Describe("VirtualMachine", func() {
 
 		It("should have stable firmware UUIDs", func() {
 			vm1, _ := DefaultVirtualMachineWithNames(true, "testvm1", "testvmi1")
-			vmi1 := controller.setupVMIFromVM(vm1)
+			vmi1, err := controller.setupVMIFromVM(vm1)
+			Expect(err).ToNot(HaveOccurred())
 
 			// intentionally use the same names
 			vm2, _ := DefaultVirtualMachineWithNames(true, "testvm1", "testvmi1")
-			vmi2 := controller.setupVMIFromVM(vm2)
+			vmi2, err := controller.setupVMIFromVM(vm2)
+			Expect(err).ToNot(HaveOccurred())
 			Expect(vmi1.Spec.Domain.Firmware.UUID).To(Equal(vmi2.Spec.Domain.Firmware.UUID))
 
 			// now we want different names
 			vm3, _ := DefaultVirtualMachineWithNames(true, "testvm3", "testvmi3")
-			vmi3 := controller.setupVMIFromVM(vm3)
+			vmi3, err := controller.setupVMIFromVM(vm3)
+			Expect(err).ToNot(HaveOccurred())
 			Expect(vmi1.Spec.Domain.Firmware.UUID).NotTo(Equal(vmi3.Spec.Domain.Firmware.UUID))
 		})
 
@@ -2581,7 +2597,8 @@ var _ = Describe("VirtualMachine", func() {
 			vm1, _ := DefaultVirtualMachineWithNames(true, "testvm1", "testvmi1")
 			vm1.Spec.Template.Spec.Domain.Firmware = &v1.Firmware{UUID: types.UID(uid)}
 
-			vmi1 := controller.setupVMIFromVM(vm1)
+			vmi1, err := controller.setupVMIFromVM(vm1)
+			Expect(err).ToNot(HaveOccurred())
 			Expect(string(vmi1.Spec.Domain.Firmware.UUID)).To(Equal(uid))
 		})
 
@@ -2636,7 +2653,6 @@ var _ = Describe("VirtualMachine", func() {
 		It("should delete VirtualMachineInstance when VirtualMachine marked for deletion", func() {
 			vm, vmi := DefaultVirtualMachine(true)
 			vm.DeletionTimestamp = now()
-			vm.DeletionGracePeriodSeconds = kvpointer.P(v1.DefaultGracePeriodSeconds)
 
 			vm, err := virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Create(context.TODO(), vm, metav1.CreateOptions{})
 			Expect(err).To(Succeed())
@@ -2645,8 +2661,6 @@ var _ = Describe("VirtualMachine", func() {
 			_, err = virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Create(context.TODO(), vmi, metav1.CreateOptions{})
 			Expect(err).ToNot(HaveOccurred())
 			vmiFeeder.Add(vmi)
-
-			shouldExpectGracePeriodPatched(v1.DefaultGracePeriodSeconds)
 
 			sanityExecute(vm)
 
@@ -3494,7 +3508,8 @@ var _ = Describe("VirtualMachine", func() {
 					Phase:     phase,
 				}
 
-				vmi := controller.setupVMIFromVM(vm)
+				vmi, err := controller.setupVMIFromVM(vm)
+				Expect(err).ToNot(HaveOccurred())
 				Expect(vmi.Spec.Volumes).To(BeEmpty())
 
 			},
@@ -4012,7 +4027,6 @@ var _ = Describe("VirtualMachine", func() {
 					vm, vmi := DefaultVirtualMachine(true)
 
 					vm.ObjectMeta.DeletionTimestamp = &metav1.Time{Time: time.Now()}
-					vm.DeletionGracePeriodSeconds = kvpointer.P(v1.DefaultGracePeriodSeconds)
 					vmi.Status.Phase = phase
 
 					if condType != "" {
@@ -4029,8 +4043,6 @@ var _ = Describe("VirtualMachine", func() {
 					vmi, err = virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Create(context.Background(), vmi, metav1.CreateOptions{})
 					Expect(err).NotTo(HaveOccurred())
 					vmiFeeder.Add(vmi)
-
-					shouldExpectGracePeriodPatched(v1.DefaultGracePeriodSeconds)
 
 					sanityExecute(vm)
 
@@ -5610,15 +5622,16 @@ var _ = Describe("VirtualMachine", func() {
 		Context("Live update features", func() {
 			const maxSocketsFromSpec uint32 = 24
 			const maxSocketsFromConfig uint32 = 48
-			maxGuestFromSpec := resource.MustParse("128Mi")
-			maxGuestFromConfig := resource.MustParse("256Mi")
+			maxGuestFromSpec := resource.MustParse("4Gi")
+			maxGuestFromConfig := resource.MustParse("8Gi")
 
 			Context("CPU", func() {
 				It("should honour the maximum CPU sockets from VM spec", func() {
 					vm, _ := DefaultVirtualMachine(true)
 					vm.Spec.Template.Spec.Domain.CPU = &v1.CPU{MaxSockets: maxSocketsFromSpec}
 
-					vmi := controller.setupVMIFromVM(vm)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
 					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(maxSocketsFromSpec))
 				})
 
@@ -5639,7 +5652,8 @@ var _ = Describe("VirtualMachine", func() {
 						},
 					})
 
-					vmi := controller.setupVMIFromVM(vm)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
 					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(maxSocketsFromSpec))
 				})
 
@@ -5659,7 +5673,8 @@ var _ = Describe("VirtualMachine", func() {
 						},
 					})
 
-					vmi := controller.setupVMIFromVM(vm)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
 					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(maxSocketsFromConfig))
 				})
 
@@ -5681,7 +5696,8 @@ var _ = Describe("VirtualMachine", func() {
 						},
 					})
 
-					vmi := controller.setupVMIFromVM(vm)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
 					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(cpuSockets * 4))
 				})
 
@@ -5700,7 +5716,8 @@ var _ = Describe("VirtualMachine", func() {
 						},
 					})
 
-					vmi := controller.setupVMIFromVM(vm)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
 					Expect(vmi.Spec.Domain.CPU.MaxSockets).To(Equal(defaultSockets * 4))
 				})
 
@@ -5815,6 +5832,31 @@ var _ = Describe("VirtualMachine", func() {
 					expectedCpuLim.Add(*resourcesDelta)
 					Expect(vmi.Spec.Domain.Resources.Limits.Cpu().String()).To(Equal(expectedCpuLim.String()))
 				})
+
+				It("should set a restartRequired condition if NetworkInterfaceMultiQueue is enabled", func() {
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.Template.Spec.Domain.CPU = &v1.CPU{
+						Sockets: 2,
+					}
+					vm.Spec.Template.Spec.Domain.Devices.NetworkInterfaceMultiQueue = kvpointer.P(true)
+
+					vmi := api.NewMinimalVMI(vm.Name)
+					vmi.Spec.Domain.CPU = &v1.CPU{
+						Sockets:    1,
+						MaxSockets: 4,
+					}
+
+					Expect(controller.handleCPUChangeRequest(vm, vmi)).To(Succeed())
+
+					vmCondManager := virtcontroller.NewVirtualMachineConditionManager()
+					cond := vmCondManager.GetCondition(vm, v1.VirtualMachineRestartRequired)
+					Expect(cond).To(Not(BeNil()))
+					Expect(*cond).To(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+						"Type":    Equal(v1.VirtualMachineRestartRequired),
+						"Message": ContainSubstring("when NetworkInterfaceMultiQueue is enabled"),
+						"Status":  Equal(k8sv1.ConditionTrue),
+					}))
+				})
 			})
 
 			Context("Memory", func() {
@@ -5826,7 +5868,8 @@ var _ = Describe("VirtualMachine", func() {
 						MaxGuest: &maxGuestFromSpec,
 					}
 
-					vmi := controller.setupVMIFromVM(vm)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
 					Expect(*vmi.Spec.Domain.Memory.MaxGuest).To(Equal(maxGuestFromSpec))
 				})
 
@@ -5851,14 +5894,17 @@ var _ = Describe("VirtualMachine", func() {
 						},
 					})
 
-					vmi := controller.setupVMIFromVM(vm)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
 					Expect(*vmi.Spec.Domain.Memory.MaxGuest).To(Equal(maxGuestFromSpec))
 				})
 
 				It("should use maxGuest configured in cluster config when its not set in VM spec", func() {
 					vm, _ := DefaultVirtualMachine(true)
-					guestMemory := resource.MustParse("64Mi")
+					guestMemory := resource.MustParse("1Gi")
 					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+					vm.Spec.Template.Spec.Architecture = "amd64"
+
 					testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
 						Spec: v1.KubeVirtSpec{
 							Configuration: v1.KubeVirtConfiguration{
@@ -5873,14 +5919,17 @@ var _ = Describe("VirtualMachine", func() {
 						},
 					})
 
-					vmi := controller.setupVMIFromVM(vm)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
 					Expect(*vmi.Spec.Domain.Memory.MaxGuest).To(Equal(maxGuestFromConfig))
 				})
 
 				It("should calculate maxGuest to be `MaxHotplugRatio` times the configured guest memory when no maxGuest is defined", func() {
 					vm, _ := DefaultVirtualMachine(true)
-					guestMemory := resource.MustParse("64Mi")
+					guestMemory := resource.MustParse("1Gi")
 					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+					vm.Spec.Template.Spec.Architecture = "amd64"
+
 					testutils.UpdateFakeKubeVirtClusterConfig(kvInformer, &v1.KubeVirt{
 						Spec: v1.KubeVirtSpec{
 							Configuration: v1.KubeVirtConfiguration{
@@ -5892,22 +5941,21 @@ var _ = Describe("VirtualMachine", func() {
 						},
 					})
 
-					vmi := controller.setupVMIFromVM(vm)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
 					Expect(vmi.Spec.Domain.Memory.MaxGuest.Value()).To(Equal(guestMemory.Value() * int64(config.GetMaxHotplugRatio())))
 				})
 
 				DescribeTable("should patch VMI when memory hotplug is requested", func(resources v1.ResourceRequirements) {
 					vm, _ := DefaultVirtualMachine(true)
-					newMemory := resource.MustParse("128Mi")
+					newMemory := resource.MustParse("2Gi")
 					vm.Spec.Template.Spec.Domain.Resources = resources
-					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{
-						Guest:    &newMemory,
-						MaxGuest: &maxGuestFromSpec,
-					}
+					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: &newMemory}
+					vm.Spec.Template.Spec.Architecture = "amd64"
 
 					vmi := api.NewMinimalVMI(vm.Name)
-					guestMemory := resource.MustParse("64Mi")
-					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+					guestMemory := resource.MustParse("1Gi")
+					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory, MaxGuest: &maxGuestFromSpec}
 					vmi.Spec.Domain.Resources = resources
 
 					vmi.Status.Memory = &v1.MemoryStatus{
@@ -5923,6 +5971,10 @@ var _ = Describe("VirtualMachine", func() {
 
 					vmi, err = virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Get(context.Background(), vmi.Name, metav1.GetOptions{})
 					Expect(err).NotTo(HaveOccurred())
+
+					vmConditionController := virtcontroller.NewVirtualMachineConditionManager()
+					Expect(vmConditionController.HasCondition(vm, v1.VirtualMachineRestartRequired)).To(BeFalse(), "No RestartRequired condition should be set")
+
 					Expect(vmi.Spec.Domain.Memory.Guest.Cmp(*vm.Spec.Template.Spec.Domain.Memory.Guest)).To(Equal(0), "The VMI Guest should match VM's")
 
 					if !resources.Requests.Memory().IsZero() {
@@ -5932,15 +5984,15 @@ var _ = Describe("VirtualMachine", func() {
 				},
 					Entry("with memory request set", v1.ResourceRequirements{
 						Requests: k8sv1.ResourceList{
-							k8sv1.ResourceMemory: resource.MustParse("128Mi"),
+							k8sv1.ResourceMemory: resource.MustParse("1Gi"),
 						},
 					}),
 					Entry("with memory request and limits set", v1.ResourceRequirements{
 						Requests: k8sv1.ResourceList{
-							k8sv1.ResourceMemory: resource.MustParse("128Mi"),
+							k8sv1.ResourceMemory: resource.MustParse("1Gi"),
 						},
 						Limits: k8sv1.ResourceList{
-							k8sv1.ResourceMemory: resource.MustParse("512Mi"),
+							k8sv1.ResourceMemory: resource.MustParse("4Gi"),
 						},
 					}),
 				)
@@ -5948,14 +6000,12 @@ var _ = Describe("VirtualMachine", func() {
 				It("should not patch VMI if memory hotplug is already in progress", func() {
 					vm, _ := DefaultVirtualMachine(true)
 					newMemory := resource.MustParse("128Mi")
-					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{
-						Guest:    &newMemory,
-						MaxGuest: &maxGuestFromSpec,
-					}
+					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: &newMemory}
+					vm.Spec.Template.Spec.Architecture = "amd64"
 
 					vmi := api.NewMinimalVMI(vm.Name)
-					guestMemory := resource.MustParse("64Mi")
-					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+					guestMemory := resource.MustParse("1Gi")
+					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory, MaxGuest: &maxGuestFromSpec}
 					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = guestMemory
 					vmi.Status.Memory = &v1.MemoryStatus{
 						GuestAtBoot:    &guestMemory,
@@ -5976,19 +6026,19 @@ var _ = Describe("VirtualMachine", func() {
 				It("should not patch VMI if a migration is in progress", func() {
 					vm, _ := DefaultVirtualMachine(true)
 					newMemory := resource.MustParse("128Mi")
-					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{
-						Guest:    &newMemory,
-						MaxGuest: &maxGuestFromSpec,
-					}
+					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: &newMemory}
+					vm.Spec.Template.Spec.Architecture = "amd64"
 
 					vmi := api.NewMinimalVMI(vm.Name)
-					guestMemory := resource.MustParse("64Mi")
-					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+					guestMemory := resource.MustParse("1Gi")
+					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory, MaxGuest: &maxGuestFromSpec}
 					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = guestMemory
 					vmi.Status.Memory = &v1.MemoryStatus{
 						GuestAtBoot:  &guestMemory,
 						GuestCurrent: &guestMemory,
 					}
+					vmi.Spec.Architecture = "amd64"
+
 					migrationStart := metav1.Now()
 					vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
 						StartTimestamp: &migrationStart,
@@ -5999,47 +6049,227 @@ var _ = Describe("VirtualMachine", func() {
 				})
 
 				It("should not patch VMI if guest memory did not change", func() {
-					guestMemory := resource.MustParse("64Mi")
+					guestMemory := resource.MustParse("1Gi")
 					vm, _ := DefaultVirtualMachine(true)
-					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{
-						Guest:    &guestMemory,
-						MaxGuest: &maxGuestFromSpec,
-					}
+					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+					vm.Spec.Template.Spec.Architecture = "amd64"
 
 					vmi := api.NewMinimalVMI(vm.Name)
-					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory, MaxGuest: &maxGuestFromSpec}
 					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = guestMemory
 					vmi.Status.Memory = &v1.MemoryStatus{
 						GuestAtBoot:  &guestMemory,
 						GuestCurrent: &guestMemory,
 					}
+					vmi.Spec.Architecture = "amd64"
 
 					err := controller.handleMemoryHotplugRequest(vm, vmi)
 					Expect(err).ToNot(HaveOccurred())
 				})
 
 				It("should set a restartRequired condition if the memory decreased from start", func() {
-					guestMemory := resource.MustParse("64Mi")
-					newMemory := resource.MustParse("32Mi")
+					guestMemory := resource.MustParse("2Gi")
+					newMemory := resource.MustParse("1Gi")
 					vm, _ := DefaultVirtualMachine(true)
-					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{
-						Guest:    &newMemory,
-						MaxGuest: &maxGuestFromSpec,
-					}
+					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: &newMemory}
+					vm.Spec.Template.Spec.Architecture = "amd64"
 
 					vmi := api.NewMinimalVMI(vm.Name)
-					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory}
+					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory, MaxGuest: &maxGuestFromSpec}
 					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = guestMemory
 					vmi.Status.Memory = &v1.MemoryStatus{
 						GuestAtBoot:  &guestMemory,
 						GuestCurrent: &guestMemory,
 					}
+					vmi.Spec.Architecture = "amd64"
 
 					err := controller.handleMemoryHotplugRequest(vm, vmi)
 					Expect(err).ToNot(HaveOccurred())
 
 					vmConditionController := virtcontroller.NewVirtualMachineConditionManager()
 					Expect(vmConditionController.HasCondition(vm, v1.VirtualMachineRestartRequired)).To(BeTrue())
+				})
+
+				DescribeTable("should always set memory.guest", func(setupVM func(*v1.VirtualMachineInstanceSpec)) {
+					vm, _ := DefaultVirtualMachine(false)
+					// clear out domain to prevent conflicts
+					vm.Spec.Template.Spec.Domain = v1.DomainSpec{}
+
+					setupVM(&vm.Spec.Template.Spec)
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(vmi.Spec.Domain.Memory.Guest).ToNot(BeNil())
+					Expect(vmi.Spec.Domain.Memory.Guest.String()).To(Equal("1Gi"))
+				},
+					Entry("when requests are set",
+						func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+							vmiSpec.Domain.Resources = v1.ResourceRequirements{
+								Requests: k8sv1.ResourceList{k8sv1.ResourceMemory: resource.MustParse("1Gi")},
+							}
+						}),
+					Entry("when limits are set",
+						func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+							vmiSpec.Domain.Resources = v1.ResourceRequirements{
+								Limits: k8sv1.ResourceList{k8sv1.ResourceMemory: resource.MustParse("1Gi")},
+							}
+						}),
+					Entry("when both requests and limits are set",
+						func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+							vmiSpec.Domain.Resources = v1.ResourceRequirements{
+								Requests: k8sv1.ResourceList{k8sv1.ResourceMemory: resource.MustParse("1Gi")},
+								Limits:   k8sv1.ResourceList{k8sv1.ResourceMemory: resource.MustParse("1Gi")},
+							}
+						}),
+					Entry("when only hugepages pagesize is set",
+						func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+							vmiSpec.Domain.Memory = &v1.Memory{
+								Hugepages: &v1.Hugepages{PageSize: "1Gi"},
+							}
+						}),
+				)
+
+				It("should set a restartRequired condition if VM does not support memory hotplug", func() {
+					guestMemory := resource.MustParse("2Gi")
+					newMemory := resource.MustParse("4Gi")
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: &newMemory}
+					vm.Spec.Template.Spec.Architecture = "risc-v"
+
+					vmi := api.NewMinimalVMI(vm.Name)
+					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory, MaxGuest: &maxGuestFromSpec}
+					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = guestMemory
+					vmi.Status.Memory = &v1.MemoryStatus{
+						GuestAtBoot:  &guestMemory,
+						GuestCurrent: &guestMemory,
+					}
+					vmi.Spec.Architecture = "amd64"
+
+					err := controller.handleMemoryHotplugRequest(vm, vmi)
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(virtFakeClient.Actions()).To(WithTransform(func(actions []testing.Action) []testing.Action {
+						var patchActions []testing.Action
+						for _, action := range actions {
+							if action.GetVerb() == "patch" && action.GetResource().Resource == "virtualmachineinstances" {
+								patchActions = append(patchActions, action)
+							}
+						}
+						return patchActions
+					}, BeEmpty()))
+
+					vmCondManager := virtcontroller.NewVirtualMachineConditionManager()
+					cond := vmCondManager.GetCondition(vm, v1.VirtualMachineRestartRequired)
+					Expect(cond).To(Not(BeNil()))
+					Expect(*cond).To(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+						"Type":    Equal(v1.VirtualMachineRestartRequired),
+						"Message": ContainSubstring("memory hotplug not supported"),
+						"Status":  Equal(k8sv1.ConditionTrue),
+					}))
+				})
+
+				DescribeTable("should leave MaxGuest empty when memory hotplug is incompatible", func(vmSetup func(*v1.VirtualMachineInstanceSpec)) {
+					vm, _ := DefaultVirtualMachine(false)
+					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: kvpointer.P(resource.MustParse("1Gi"))}
+
+					vmSetup(&vm.Spec.Template.Spec)
+
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(vmi.Spec.Domain.Memory.MaxGuest).To(BeNil())
+				},
+					Entry("realtime is configured", func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+						vmiSpec.Domain.CPU = &v1.CPU{
+							DedicatedCPUPlacement: true,
+							Realtime:              &v1.Realtime{},
+							NUMA: &v1.NUMA{
+								GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+							},
+						}
+						vmiSpec.Domain.Memory.Hugepages = &v1.Hugepages{
+							PageSize: "2Mi",
+						}
+					}),
+					Entry("launchSecurity is configured", func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+						vmiSpec.Domain.LaunchSecurity = &v1.LaunchSecurity{}
+					}),
+					Entry("guest mapping passthrough is configured", func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+						vmiSpec.Domain.CPU = &v1.CPU{
+							DedicatedCPUPlacement: true,
+							NUMA: &v1.NUMA{
+								GuestMappingPassthrough: &v1.NUMAGuestMappingPassthrough{},
+							},
+						}
+						vmiSpec.Domain.Memory.Hugepages = &v1.Hugepages{
+							PageSize: "2Mi",
+						}
+					}),
+					Entry("guest memory is not set", func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+						vmiSpec.Domain.Memory.Guest = nil
+					}),
+					Entry("guest memory is greater than maxGuest", func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+						vmiSpec.Domain.Memory.Guest = kvpointer.P(resource.MustParse("1Ti"))
+					}),
+					Entry("guest memory is not properly aligned", func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+						unAlignedMemory := resource.MustParse("123")
+						vmiSpec.Domain.Memory.Guest = &unAlignedMemory
+					}),
+					Entry("guest memory with hugepages is not properly aligned", func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+						vmiSpec.Domain.Memory.Guest = kvpointer.P(resource.MustParse("2G"))
+						vmiSpec.Domain.Memory.Hugepages = &v1.Hugepages{PageSize: "1Gi"}
+					}),
+					Entry("architecture is not amd64 or arm64", func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+						vmiSpec.Architecture = "risc-v"
+					}),
+					Entry("guest memory is less than 1Gi", func(vmiSpec *v1.VirtualMachineInstanceSpec) {
+						vmiSpec.Domain.Memory.Guest = kvpointer.P(resource.MustParse("512Mi"))
+					}),
+				)
+
+				It("should set a restartRequired condition if memory hotplug failed", func() {
+					guestMemory := resource.MustParse("1Gi")
+					newMemory := resource.MustParse("2Gi")
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{Guest: &newMemory}
+					vm.Spec.Template.Spec.Architecture = "amd64"
+
+					vmi := api.NewMinimalVMI(vm.Name)
+					vmi.Spec.Domain.Memory = &v1.Memory{Guest: &guestMemory, MaxGuest: &maxGuestFromSpec}
+					vmi.Spec.Domain.Resources.Requests[k8sv1.ResourceMemory] = guestMemory
+					vmi.Status.Memory = &v1.MemoryStatus{
+						GuestAtBoot:  &guestMemory,
+						GuestCurrent: &guestMemory,
+					}
+					vmi.Spec.Architecture = "amd64"
+
+					vmiCondManager := virtcontroller.NewVirtualMachineInstanceConditionManager()
+					vmiCondManager.UpdateCondition(vmi, &v1.VirtualMachineInstanceCondition{
+						Type:   v1.VirtualMachineInstanceMemoryChange,
+						Status: k8sv1.ConditionFalse,
+					})
+
+					err := controller.handleMemoryHotplugRequest(vm, vmi)
+					Expect(err).ToNot(HaveOccurred())
+
+					Expect(virtFakeClient.Actions()).To(WithTransform(func(actions []testing.Action) []testing.Action {
+						var patchActions []testing.Action
+						for _, action := range actions {
+							if action.GetVerb() == "patch" && action.GetResource().Resource == "virtualmachineinstances" {
+								patchActions = append(patchActions, action)
+							}
+						}
+						return patchActions
+					}, BeEmpty()))
+
+					vmCondManager := virtcontroller.NewVirtualMachineConditionManager()
+					cond := vmCondManager.GetCondition(vm, v1.VirtualMachineRestartRequired)
+					Expect(cond).To(Not(BeNil()))
+					Expect(*cond).To(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{
+						"Type":    Equal(v1.VirtualMachineRestartRequired),
+						"Message": ContainSubstring("memory updated in template spec. Memory-hotplug failed and is not available for this VM configuration"),
+						"Status":  Equal(k8sv1.ConditionTrue),
+					}))
 				})
 			})
 
@@ -6165,6 +6395,51 @@ var _ = Describe("VirtualMachine", func() {
 						},
 					),
 				)
+
+				It("setupVMIFromVM should handle vm.spec.template.spec.domain.memory being nil and populate MaxGuest", func() {
+					fakeInstancetypeClients := fake.NewSimpleClientset().InstancetypeV1beta1()
+					fakeInstancetypeClient := fakeInstancetypeClients.VirtualMachineInstancetypes(metav1.NamespaceDefault)
+					virtClient.EXPECT().VirtualMachineInstancetype(gomock.Any()).Return(fakeInstancetypeClient).AnyTimes()
+
+					controller.instancetypeMethods = &instancetype.InstancetypeMethods{
+						Clientset: virtClient,
+					}
+
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.Template.Spec.Architecture = "amd64"
+					vm.Spec.Template.Spec.Domain.CPU = nil
+					vm.Spec.Template.Spec.Domain.Memory = nil
+					vm.Spec.Template.Spec.Domain.Resources = v1.ResourceRequirements{}
+
+					instancetypeMemoryGuest := resource.MustParse("1Gi")
+					instancetype := &instancetypev1beta1.VirtualMachineInstancetype{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "instancetype",
+						},
+						Spec: instancetypev1beta1.VirtualMachineInstancetypeSpec{
+							CPU: instancetypev1beta1.CPUInstancetype{
+								Guest: 1,
+							},
+							Memory: instancetypev1beta1.MemoryInstancetype{
+								Guest: instancetypeMemoryGuest,
+							},
+						},
+					}
+					instancetype, err := virtClient.VirtualMachineInstancetype(vm.Namespace).Create(context.TODO(), instancetype, metav1.CreateOptions{})
+					Expect(err).To(Succeed())
+					vm.Spec.Instancetype = &v1.InstancetypeMatcher{
+						Name: instancetype.Name,
+						Kind: instancetypeapi.SingularResourceName,
+					}
+
+					vmi, err := controller.setupVMIFromVM(vm)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(vmi.Spec.Domain.Memory).ToNot(BeNil())
+					Expect(vmi.Spec.Domain.Memory.Guest).ToNot(BeNil())
+					Expect(vmi.Spec.Domain.Memory.Guest.Value()).To(Equal(instancetypeMemoryGuest.Value()))
+					Expect(vmi.Spec.Domain.Memory.MaxGuest).ToNot(BeNil())
+					Expect(vmi.Spec.Domain.Memory.MaxGuest.Value()).To(Equal(instancetypeMemoryGuest.Value() * int64(controller.clusterConfig.GetMaxHotplugRatio())))
+				})
 			})
 		})
 
@@ -6189,6 +6464,64 @@ var _ = Describe("VirtualMachine", func() {
 					Expect(*vmi.Status.CurrentCPUTopology).To(Equal(v1.CPUTopology{
 						Cores:   1,
 						Sockets: 1,
+						Threads: 1,
+					}))
+
+					testutils.ExpectEvent(recorder, SuccessfulCreateVirtualMachineReason)
+				})
+
+				It("Sets the instance type derived CPU topology in VMI status", func() {
+					fakeInstancetypeClients := fake.NewSimpleClientset().InstancetypeV1beta1()
+					fakeInstancetypeClient := fakeInstancetypeClients.VirtualMachineInstancetypes(metav1.NamespaceDefault)
+					virtClient.EXPECT().VirtualMachineInstancetype(gomock.Any()).Return(fakeInstancetypeClient).AnyTimes()
+
+					controller.instancetypeMethods = &instancetype.InstancetypeMethods{
+						Clientset: virtClient,
+					}
+
+					vm, _ := DefaultVirtualMachine(true)
+					vm.Spec.Template.Spec.Domain.CPU = nil
+					vm.Spec.Template.Spec.Domain.Memory = nil
+					vm.Spec.Template.Spec.Domain.Resources = v1.ResourceRequirements{}
+
+					const vCPUsProvidedByInstancetype = 2
+					instancetype := &instancetypev1beta1.VirtualMachineInstancetype{
+						ObjectMeta: metav1.ObjectMeta{
+							Name: "instancetype",
+						},
+						Spec: instancetypev1beta1.VirtualMachineInstancetypeSpec{
+							CPU: instancetypev1beta1.CPUInstancetype{
+								Guest: vCPUsProvidedByInstancetype,
+							},
+							Memory: instancetypev1beta1.MemoryInstancetype{
+								Guest: resource.MustParse("128Mi"),
+							},
+						},
+					}
+					instancetype, err := virtClient.VirtualMachineInstancetype(vm.Namespace).Create(context.TODO(), instancetype, metav1.CreateOptions{})
+					Expect(err).To(Succeed())
+					vm.Spec.Instancetype = &v1.InstancetypeMatcher{
+						Name: instancetype.Name,
+						Kind: instancetypeapi.SingularResourceName,
+					}
+
+					vm, err = virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Create(context.TODO(), vm, metav1.CreateOptions{})
+					Expect(err).To(Succeed())
+					addVirtualMachine(vm)
+
+					sanityExecute(vm)
+
+					vm, err = virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Get(context.TODO(), vm.Name, metav1.GetOptions{})
+					Expect(err).To(Succeed())
+					Expect(vm.Status.Created).To(BeFalse())
+					Expect(vm.Status.Ready).To(BeFalse())
+
+					vmi, err := virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Get(context.Background(), vm.Name, metav1.GetOptions{})
+					Expect(err).NotTo(HaveOccurred())
+					Expect(vmi.Status.CurrentCPUTopology).To(Not(BeNil()))
+					Expect(*vmi.Status.CurrentCPUTopology).To(Equal(v1.CPUTopology{
+						Cores:   1,
+						Sockets: vCPUsProvidedByInstancetype,
 						Threads: 1,
 					}))
 
@@ -6306,13 +6639,14 @@ var _ = Describe("VirtualMachine", func() {
 				crSource.Add(createVMRevision(vm))
 
 				By("Creating a VMI with cluster max")
-				vmi = controller.setupVMIFromVM(vm)
+				vmi, err := controller.setupVMIFromVM(vm)
+				Expect(err).ToNot(HaveOccurred())
 				vmiSource.Add(vmi)
 				syncCache(controller.vmiInformer.GetIndexer(), 1)
 
 				By("Bumping the VM sockets above the cluster maximum")
 				vm.Spec.Template.Spec.Domain.CPU.Sockets = 10
-				vm, err := virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Create(context.TODO(), vm, metav1.CreateOptions{})
+				vm, err = virtFakeClient.KubevirtV1().VirtualMachines(vm.Namespace).Create(context.TODO(), vm, metav1.CreateOptions{})
 				Expect(err).To(Succeed())
 				addVirtualMachine(vm)
 
@@ -6338,7 +6672,8 @@ var _ = Describe("VirtualMachine", func() {
 
 				By("Creating a VMI with hostname 'a'")
 				vm.Spec.Template.Spec.Hostname = "a"
-				vmi = controller.setupVMIFromVM(vm)
+				vmi, err := controller.setupVMIFromVM(vm)
+				Expect(err).ToNot(HaveOccurred())
 				vmiSource.Add(vmi)
 				syncCache(controller.vmiInformer.GetIndexer(), 1)
 
@@ -6371,7 +6706,8 @@ var _ = Describe("VirtualMachine", func() {
 				crSource.Add(createVMRevision(vm))
 
 				By("Creating a VMI with cluster max")
-				vmi = controller.setupVMIFromVM(vm)
+				vmi, err := controller.setupVMIFromVM(vm)
+				Expect(err).ToNot(HaveOccurred())
 				vmiSource.Add(vmi)
 				syncCache(controller.vmiInformer.GetIndexer(), 1)
 
@@ -6401,7 +6737,8 @@ var _ = Describe("VirtualMachine", func() {
 				syncCache(controller.crInformer.GetIndexer(), 1)
 
 				By("Creating a VMI")
-				vmi = controller.setupVMIFromVM(vm)
+				vmi, err := controller.setupVMIFromVM(vm)
+				Expect(err).ToNot(HaveOccurred())
 				markAsReady(vmi)
 				vmi.Status.Memory = &v1.MemoryStatus{
 					GuestAtBoot:  &maxGuest,
@@ -6429,7 +6766,8 @@ var _ = Describe("VirtualMachine", func() {
 				By("Creating a VM with two sockets")
 				vm.Spec.Template.Spec.Domain.CPU.Sockets = 2
 
-				vmi = controller.setupVMIFromVM(vm)
+				vmi, err := controller.setupVMIFromVM(vm)
+				Expect(err).ToNot(HaveOccurred())
 				vmiSource.Add(vmi)
 				syncCache(controller.vmiInformer.GetIndexer(), 1)
 
@@ -6470,9 +6808,10 @@ var _ = Describe("VirtualMachine", func() {
 				syncCache(controller.crInformer.GetIndexer(), 1)
 
 				By("Creating a VMI")
-				vmi = controller.setupVMIFromVM(vm)
+				vmi, err := controller.setupVMIFromVM(vm)
+				Expect(err).ToNot(HaveOccurred())
 				markAsReady(vmi)
-				vmi, err := virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Create(context.Background(), vmi, metav1.CreateOptions{})
+				vmi, err = virtFakeClient.KubevirtV1().VirtualMachineInstances(vm.Namespace).Create(context.Background(), vmi, metav1.CreateOptions{})
 				Expect(err).NotTo(HaveOccurred())
 				vmiSource.Add(vmi)
 				syncCache(controller.vmiInformer.GetIndexer(), 1)

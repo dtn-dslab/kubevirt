@@ -2794,23 +2794,12 @@ var _ = Describe("Converter", func() {
 
 				Expect(domain.Spec.Memory).ToNot(BeNil())
 				Expect(domain.Spec.Memory.Unit).To(Equal("b"))
-				Expect(domain.Spec.Memory.Value).To(Equal(uint64(maxGuestMemory.Value())))
+				Expect(domain.Spec.Memory.Value).To(Equal(uint64(guestMemory.Value())))
 
 				Expect(domain.Spec.CPU.NUMA).ToNot(BeNil())
 				Expect(domain.Spec.CPU.NUMA.Cells).To(HaveLen(1))
 				Expect(domain.Spec.CPU.NUMA.Cells[0].Unit).To(Equal("b"))
 				Expect(domain.Spec.CPU.NUMA.Cells[0].Memory).To(Equal(uint64(guestMemory.Value())))
-
-				pluggableMemory := uint64(maxGuestMemory.Value() - guestMemory.Value())
-
-				Expect(domain.Spec.Devices.Memory).ToNot(BeNil())
-				Expect(domain.Spec.Devices.Memory.Model).To(Equal("virtio-mem"))
-				Expect(domain.Spec.Devices.Memory.Target).ToNot(BeNil())
-				Expect(domain.Spec.Devices.Memory.Target.Node).To(Equal("0"))
-				Expect(domain.Spec.Devices.Memory.Target.Size.Value).To(Equal(pluggableMemory))
-				Expect(domain.Spec.Devices.Memory.Target.Size.Unit).To(Equal("b"))
-				Expect(domain.Spec.Devices.Memory.Target.Block.Value).To(Equal(uint64(MemoryHotplugBlockAlignmentBytes)))
-				Expect(domain.Spec.Devices.Memory.Target.Block.Unit).To(Equal("b"))
 			})
 		})
 	})

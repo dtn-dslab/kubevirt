@@ -51,12 +51,12 @@ import (
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	"kubevirt.io/kubevirt/pkg/instancetype"
+	"kubevirt.io/kubevirt/pkg/liveupdate/memory"
 	"kubevirt.io/kubevirt/pkg/pointer"
 	"kubevirt.io/kubevirt/pkg/testutils"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 	"kubevirt.io/kubevirt/pkg/virt-config/deprecation"
-	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/converter"
 
 	rt "runtime"
 )
@@ -1900,8 +1900,8 @@ var _ = Describe("Validating VM Admitter", func() {
 			var maxGuest resource.Quantity
 
 			BeforeEach(func() {
-				guest := resource.MustParse("64Mi")
-				maxGuest = resource.MustParse("128Mi")
+				guest := resource.MustParse("1Gi")
+				maxGuest = resource.MustParse("4Gi")
 
 				vm.Spec.Template.Spec.Domain.Memory = &v1.Memory{
 					Guest:    &guest,
@@ -1920,15 +1920,6 @@ var _ = Describe("Validating VM Admitter", func() {
 				Expect(response.Allowed).To(BeFalse())
 				Expect(response.Result.Details.Causes).To(ContainElement(cause))
 			},
-				Entry("hugepages is configured", func(vm *v1.VirtualMachine) {
-					vm.Spec.Template.Spec.Domain.Memory.Hugepages = &v1.Hugepages{
-						PageSize: "2Mi",
-					}
-				}, metav1.StatusCause{
-					Type:    metav1.CauseTypeFieldValueInvalid,
-					Field:   "spec.template.spec.domain.memory.hugepages",
-					Message: "Memory hotplug is not compatible with hugepages",
-				}),
 				Entry("realtime is configured", func(vm *v1.VirtualMachine) {
 					enableFeatureGate(virtconfig.VMLiveUpdateFeaturesGate, virtconfig.NUMAFeatureGate)
 					vm.Spec.Template.Spec.Domain.CPU = &v1.CPU{
@@ -1943,7 +1934,7 @@ var _ = Describe("Validating VM Admitter", func() {
 					}
 				}, metav1.StatusCause{
 					Type:    metav1.CauseTypeFieldValueInvalid,
-					Field:   "spec.template.spec.domain.cpu.realtime",
+					Field:   "spec.template.spec.domain.memory.guest",
 					Message: "Memory hotplug is not compatible with realtime VMs",
 				}),
 				Entry("launchSecurity is configured", func(vm *v1.VirtualMachine) {
@@ -1951,15 +1942,8 @@ var _ = Describe("Validating VM Admitter", func() {
 					vm.Spec.Template.Spec.Domain.LaunchSecurity = &v1.LaunchSecurity{}
 				}, metav1.StatusCause{
 					Type:    metav1.CauseTypeFieldValueInvalid,
-					Field:   "spec.template.spec.domain.launchSecurity",
+					Field:   "spec.template.spec.domain.memory.guest",
 					Message: "Memory hotplug is not compatible with encrypted VMs",
-				}),
-				Entry("dedicated CPUs is configured", func(vm *v1.VirtualMachine) {
-					vm.Spec.Template.Spec.Domain.CPU = &v1.CPU{DedicatedCPUPlacement: true}
-				}, metav1.StatusCause{
-					Type:    metav1.CauseTypeFieldValueInvalid,
-					Field:   "spec.template.spec.domain.cpu.dedicatedCpuPlacement",
-					Message: "Memory hotplug is not compatible with dedicated CPUs",
 				}),
 				Entry("guest mapping passthrough is configured", func(vm *v1.VirtualMachine) {
 					enableFeatureGate(virtconfig.VMLiveUpdateFeaturesGate, virtconfig.NUMAFeatureGate)
@@ -1974,7 +1958,7 @@ var _ = Describe("Validating VM Admitter", func() {
 					}
 				}, metav1.StatusCause{
 					Type:    metav1.CauseTypeFieldValueInvalid,
-					Field:   "spec.template.spec.domain.cpu.numa.guestMappingPassthrough",
+					Field:   "spec.template.spec.domain.memory.guest",
 					Message: "Memory hotplug is not compatible with guest mapping passthrough",
 				}),
 				Entry("guest memory is not set", func(vm *v1.VirtualMachine) {
@@ -1995,28 +1979,44 @@ var _ = Describe("Validating VM Admitter", func() {
 					Message: "Guest memory is greater than the configured maxGuest memory",
 				}),
 				Entry("maxGuest is not properly aligned", func(vm *v1.VirtualMachine) {
-					unAlignedMemory := resource.MustParse("333Mi")
+					unAlignedMemory := resource.MustParse("2049Mi")
 					vm.Spec.Template.Spec.Domain.Memory.MaxGuest = &unAlignedMemory
 				}, metav1.StatusCause{
 					Type:    metav1.CauseTypeFieldValueInvalid,
-					Field:   "spec.template.spec.domain.memory.maxGuest",
-					Message: fmt.Sprintf("MaxGuest must be %s aligned", resource.NewQuantity(converter.MemoryHotplugBlockAlignmentBytes, resource.BinarySI)),
+					Field:   "spec.template.spec.domain.memory.guest",
+					Message: fmt.Sprintf("MaxGuest must be %s aligned", resource.NewQuantity(memory.HotplugBlockAlignmentBytes, resource.BinarySI)),
 				}),
 				Entry("guest memory is not properly aligned", func(vm *v1.VirtualMachine) {
-					unAlignedMemory := resource.MustParse("123")
+					unAlignedMemory := resource.MustParse("1025Mi")
 					vm.Spec.Template.Spec.Domain.Memory.Guest = &unAlignedMemory
 				}, metav1.StatusCause{
 					Type:    metav1.CauseTypeFieldValueInvalid,
 					Field:   "spec.template.spec.domain.memory.guest",
-					Message: fmt.Sprintf("Guest memory must be %s aligned", resource.NewQuantity(converter.MemoryHotplugBlockAlignmentBytes, resource.BinarySI)),
+					Message: fmt.Sprintf("Guest memory must be %s aligned", resource.NewQuantity(memory.HotplugBlockAlignmentBytes, resource.BinarySI)),
 				}),
-				Entry("architecture is not amd64", func(vm *v1.VirtualMachine) {
-					enableFeatureGate(virtconfig.VMLiveUpdateFeaturesGate, virtconfig.Multiarchitecture)
-					vm.Spec.Template.Spec.Architecture = "arm"
+				Entry("guest memory with hugepages is not properly aligned", func(vm *v1.VirtualMachine) {
+					vm.Spec.Template.Spec.Domain.Memory.Guest = pointer.P(resource.MustParse("2G"))
+					vm.Spec.Template.Spec.Domain.Memory.MaxGuest = pointer.P(resource.MustParse("16Gi"))
+					vm.Spec.Template.Spec.Domain.Memory.Hugepages = &v1.Hugepages{PageSize: "1Gi"}
 				}, metav1.StatusCause{
 					Type:    metav1.CauseTypeFieldValueInvalid,
-					Field:   "spec.template.spec.architecture",
-					Message: "Memory hotplug is only available for x86_64 VMs",
+					Field:   "spec.template.spec.domain.memory.guest",
+					Message: fmt.Sprintf("Guest memory must be %s aligned", resource.NewQuantity(memory.Hotplug1GHugePagesBlockAlignmentBytes, resource.BinarySI)),
+				}),
+				Entry("architecture is not amd64 or arm64", func(vm *v1.VirtualMachine) {
+					enableFeatureGate(virtconfig.VMLiveUpdateFeaturesGate, virtconfig.Multiarchitecture)
+					vm.Spec.Template.Spec.Architecture = "risc-v"
+				}, metav1.StatusCause{
+					Type:    metav1.CauseTypeFieldValueInvalid,
+					Field:   "spec.template.spec.domain.memory.guest",
+					Message: "Memory hotplug is only available for x86_64 and arm64 VMs",
+				}),
+				Entry("guest memory is less than 1Gi", func(vm *v1.VirtualMachine) {
+					vm.Spec.Template.Spec.Domain.Memory.Guest = pointer.P(resource.MustParse("512Mi"))
+				}, metav1.StatusCause{
+					Type:    metav1.CauseTypeFieldValueInvalid,
+					Field:   "spec.template.spec.domain.memory.guest",
+					Message: "Memory hotplug is only available for VMs with at least 1Gi of guest memory",
 				}),
 			)
 		})

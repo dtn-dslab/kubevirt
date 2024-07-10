@@ -85,13 +85,6 @@ const (
 	vhostNetPath = "/dev/vhost-net"
 )
 
-const (
-	// must be a power of 2 and at least equal
-	// to the size of a transparent hugepage (2MiB on x84_64).
-	// Recommended value by QEMU is 2MiB
-	MemoryHotplugBlockAlignmentBytes = 2097152
-)
-
 var (
 	BootMenuTimeoutMS = uint(10000)
 )
@@ -1264,12 +1257,12 @@ func setupDomainMemory(vmi *v1.VirtualMachineInstance, domain *api.Domain) error
 		Slots: 1,
 	}
 
-	domain.Spec.Memory = maxMemory
-
-	initialMemoryApi, err := vcpu.QuantityToByte(*vmi.Status.Memory.GuestAtBoot)
+	currentMemory, err := vcpu.QuantityToByte(*vmi.Spec.Domain.Memory.Guest)
 	if err != nil {
 		return err
 	}
+
+	domain.Spec.Memory = currentMemory
 
 	// The usage of memory devices requires a NUMA configuration for
 	// the domain, even if it's just a single NUMA node
@@ -1278,25 +1271,9 @@ func setupDomainMemory(vmi *v1.VirtualMachineInstance, domain *api.Domain) error
 			{
 				ID:     "0",
 				CPUs:   fmt.Sprintf("0-%d", domain.Spec.VCPU.CPUs-1),
-				Memory: initialMemoryApi.Value,
-				Unit:   initialMemoryApi.Unit,
+				Memory: currentMemory.Value,
+				Unit:   currentMemory.Unit,
 			},
-		},
-	}
-
-	pluggableMemory := vmi.Spec.Domain.Memory.MaxGuest.DeepCopy()
-	pluggableMemory.Sub(*vmi.Status.Memory.GuestAtBoot)
-	pluggableMemorySize, err := vcpu.QuantityToByte(pluggableMemory)
-	if err != nil {
-		return err
-	}
-
-	domain.Spec.Devices.Memory = &api.MemoryDevice{
-		Model: "virtio-mem",
-		Target: &api.MemoryTarget{
-			Size:  pluggableMemorySize,
-			Node:  "0",
-			Block: api.Memory{Unit: "b", Value: MemoryHotplugBlockAlignmentBytes},
 		},
 	}
 

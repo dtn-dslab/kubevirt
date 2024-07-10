@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"kubevirt.io/kubevirt/pkg/liveupdate/memory"
 	"kubevirt.io/kubevirt/pkg/network/namescheme"
 	"kubevirt.io/kubevirt/pkg/virt-controller/services"
 
@@ -710,6 +711,18 @@ func (c *VMController) handleCPUChangeRequest(vm *virtv1.VirtualMachine, vmi *vi
 		return nil
 	}
 
+	networkInterfaceMultiQueue := vm.Spec.Template.Spec.Domain.Devices.NetworkInterfaceMultiQueue
+	if networkInterfaceMultiQueue != nil && *networkInterfaceMultiQueue {
+		vmConditions := controller.NewVirtualMachineConditionManager()
+		vmConditions.UpdateCondition(vm, &virtv1.VirtualMachineCondition{
+			Type:               virtv1.VirtualMachineRestartRequired,
+			LastTransitionTime: metav1.Now(),
+			Status:             k8score.ConditionTrue,
+			Message:            "Changes to CPU sockets require a restart when NetworkInterfaceMultiQueue is enabled",
+		})
+		return nil
+	}
+
 	if err := c.VMICPUsPatch(vm, vmi); err != nil {
 		log.Log.Object(vmi).Errorf("unable to patch vmi to add cpu topology status: %v", err)
 		return err
@@ -1002,7 +1015,7 @@ func (c *VMController) syncRunStrategy(vm *virtv1.VirtualMachine, vmi *virtv1.Vi
 		}
 
 		// when coming here from a different RunStrategy we have to start the VM
-		if !hasStartRequest(vm) && vm.Status.RunStrategy == *vm.Spec.RunStrategy {
+		if !hasStartRequest(vm) && vm.Status.RunStrategy == runStrategy {
 			return vm, nil
 		}
 
@@ -1180,44 +1193,17 @@ func (c *VMController) startVMI(vm *virtv1.VirtualMachine) (*virtv1.VirtualMachi
 	}
 
 	// start it
-	vmi := c.setupVMIFromVM(vm)
+	vmi, err := c.setupVMIFromVM(vm)
+	if err != nil {
+		return vm, err
+	}
+
 	vmRevisionName, err := c.createVMRevision(vm)
 	if err != nil {
 		log.Log.Object(vm).Reason(err).Error(failedCreateCRforVmErrMsg)
 		return vm, err
 	}
 	vmi.Status.VirtualMachineRevisionName = vmRevisionName
-
-	setGenerationAnnotationOnVmi(vm.Generation, vmi)
-
-	// add a finalizer to ensure the VM controller has a chance to see
-	// the VMI before it is deleted
-	vmi.Finalizers = append(vmi.Finalizers, virtv1.VirtualMachineControllerFinalizer)
-
-	// We need to apply device preferences before any new network or input devices are added. Doing so allows
-	// any autoAttach preferences we might have to be applied, either enabling or disabling the attachment of these devices.
-	preferenceSpec, err := c.applyDevicePreferences(vm, vmi)
-	if err != nil {
-		log.Log.Object(vm).Infof("Failed to apply device preferences again to VirtualMachineInstance: %s/%s", vmi.Namespace, vmi.Name)
-		c.recorder.Eventf(vm, k8score.EventTypeWarning, FailedCreateVirtualMachineReason, "Error applying device preferences again: %v", err)
-		return vm, err
-	}
-
-	util.SetDefaultVolumeDisk(&vmi.Spec)
-
-	autoAttachInputDevice(vmi)
-
-	err = c.clusterConfig.SetVMISpecDefaultNetworkInterface(&vmi.Spec)
-	if err != nil {
-		return vm, err
-	}
-
-	err = c.applyInstancetypeToVmi(vm, vmi, preferenceSpec)
-	if err != nil {
-		log.Log.Object(vm).Infof("Failed to apply instancetype to VirtualMachineInstance: %s/%s", vmi.Namespace, vmi.Name)
-		c.recorder.Eventf(vm, k8score.EventTypeWarning, FailedCreateVirtualMachineReason, "Error creating virtual machine instance: Failed to apply instancetype: %v", err)
-		return vm, err
-	}
 
 	c.expectations.ExpectCreations(vmKey, 1)
 	vmi, err = c.clientset.VirtualMachineInstance(vm.ObjectMeta.Namespace).Create(context.Background(), vmi, metav1.CreateOptions{})
@@ -1503,16 +1489,6 @@ func (c *VMController) stopVMI(vm *virtv1.VirtualMachine, vmi *virtv1.VirtualMac
 	}
 
 	// stop it
-	// if for some reason the VM has been requested to be deleted, we want to use the
-	// deletion grace period specified to the VM as the TerminationGracePeriodSeconds
-	// for the VMI.
-	if vm.DeletionTimestamp != nil {
-		err = c.patchVMITerminationGracePeriod(vm.GetDeletionGracePeriodSeconds(), vmi)
-		if err != nil {
-			log.Log.Object(vmi).Errorf("unable to patch vmi termination grace period: %v", err)
-			return vm, err
-		}
-	}
 	c.expectations.ExpectDeletions(vmKey, []string{controller.VirtualMachineInstanceKey(vmi)})
 	err = c.clientset.VirtualMachineInstance(vm.ObjectMeta.Namespace).Delete(context.Background(), vmi.ObjectMeta.Name, v1.DeleteOptions{})
 
@@ -1740,7 +1716,7 @@ func hasCompletedMemoryDump(vm *virtv1.VirtualMachine) bool {
 }
 
 // setupVMIfromVM creates a VirtualMachineInstance object from one VirtualMachine object.
-func (c *VMController) setupVMIFromVM(vm *virtv1.VirtualMachine) *virtv1.VirtualMachineInstance {
+func (c *VMController) setupVMIFromVM(vm *virtv1.VirtualMachine) (*virtv1.VirtualMachineInstance, error) {
 	vmi := virtv1.NewVMIReferenceFromNameWithNS(vm.ObjectMeta.Namespace, "")
 	vmi.ObjectMeta = *vm.Spec.Template.ObjectMeta.DeepCopy()
 	vmi.ObjectMeta.Name = vm.ObjectMeta.Name
@@ -1766,6 +1742,45 @@ func (c *VMController) setupVMIFromVM(vm *virtv1.VirtualMachine) *virtv1.Virtual
 		*v1.NewControllerRef(vm, virtv1.VirtualMachineGroupVersionKind),
 	}
 
+	setGenerationAnnotationOnVmi(vm.Generation, vmi)
+
+	// add a finalizer to ensure the VM controller has a chance to see
+	// the VMI before it is deleted
+	vmi.Finalizers = append(vmi.Finalizers, virtv1.VirtualMachineControllerFinalizer)
+
+	// We need to apply device preferences before any new network or input devices are added. Doing so allows
+	// any autoAttach preferences we might have to be applied, either enabling or disabling the attachment of these devices.
+	preferenceSpec, err := c.applyDevicePreferences(vm, vmi)
+	if err != nil {
+		log.Log.Object(vm).Infof("Failed to apply device preferences again to VirtualMachineInstance: %s/%s", vmi.Namespace, vmi.Name)
+		c.recorder.Eventf(vm, k8score.EventTypeWarning, FailedCreateVirtualMachineReason, "Error applying device preferences again: %v", err)
+		return vmi, err
+	}
+
+	util.SetDefaultVolumeDisk(&vmi.Spec)
+
+	autoAttachInputDevice(vmi)
+
+	err = c.clusterConfig.SetVMISpecDefaultNetworkInterface(&vmi.Spec)
+	if err != nil {
+		return vmi, err
+	}
+
+	err = c.applyInstancetypeToVmi(vm, vmi, preferenceSpec)
+	if err != nil {
+		log.Log.Object(vm).Infof("Failed to apply instancetype to VirtualMachineInstance: %s/%s", vmi.Namespace, vmi.Name)
+		c.recorder.Eventf(vm, k8score.EventTypeWarning, FailedCreateVirtualMachineReason, "Error creating virtual machine instance: Failed to apply instancetype: %v", err)
+		return vmi, err
+	}
+
+	setGuestMemory(&vmi.Spec)
+	c.setupHotplug(vmi)
+	c.setupCurrentCPUTopology(vmi)
+
+	return vmi, nil
+}
+
+func (c *VMController) setupCurrentCPUTopology(vmi *virtv1.VirtualMachineInstance) {
 	VMIDefaults := &virtv1.VirtualMachineInstance{}
 	VMIDefaults.Spec.Domain.Resources = vmi.Spec.Domain.Resources
 	webhooks.SetDefaultGuestCPUTopology(c.clusterConfig, &VMIDefaults.Spec)
@@ -1776,7 +1791,7 @@ func (c *VMController) setupVMIFromVM(vm *virtv1.VirtualMachine) *virtv1.Virtual
 		Threads: VMIDefaults.Spec.Domain.CPU.Threads,
 	}
 
-	if topology := vm.Spec.Template.Spec.Domain.CPU; topology != nil {
+	if topology := vmi.Spec.Domain.CPU; topology != nil {
 		if topology.Sockets != 0 {
 			vmi.Status.CurrentCPUTopology.Sockets = topology.Sockets
 		}
@@ -1787,10 +1802,6 @@ func (c *VMController) setupVMIFromVM(vm *virtv1.VirtualMachine) *virtv1.Virtual
 			vmi.Status.CurrentCPUTopology.Threads = topology.Threads
 		}
 	}
-
-	c.setupHotplug(vmi, VMIDefaults)
-
-	return vmi
 }
 
 func (c *VMController) applyInstancetypeToVmi(vm *virtv1.VirtualMachine, vmi *virtv1.VirtualMachineInstance, preferenceSpec *instancetypev1beta1.VirtualMachinePreferenceSpec) error {
@@ -1871,7 +1882,7 @@ func setupStableFirmwareUUID(vm *virtv1.VirtualMachine, vmi *virtv1.VirtualMachi
 	vmi.Spec.Domain.Firmware.UUID = types.UID(uuid.NewSHA1(firmwareUUIDns, []byte(vmi.ObjectMeta.Name)).String())
 }
 
-func (c *VMController) setupCPUHotplug(vmi *virtv1.VirtualMachineInstance, VMIDefaults *virtv1.VirtualMachineInstance, maxRatio uint32) {
+func (c *VMController) setupCPUHotplug(vmi *virtv1.VirtualMachineInstance, maxRatio uint32) {
 	if vmi.Spec.Domain.CPU == nil {
 		vmi.Spec.Domain.CPU = &virtv1.CPU{}
 	}
@@ -1884,23 +1895,32 @@ func (c *VMController) setupCPUHotplug(vmi *virtv1.VirtualMachineInstance, VMIDe
 		vmi.Spec.Domain.CPU.MaxSockets = vmi.Spec.Domain.CPU.Sockets * maxRatio
 	}
 
+	const defaultNumberOfSockets = 1
 	if vmi.Spec.Domain.CPU.MaxSockets == 0 {
-		vmi.Spec.Domain.CPU.MaxSockets = VMIDefaults.Spec.Domain.CPU.Sockets * maxRatio
+		vmi.Spec.Domain.CPU.MaxSockets = defaultNumberOfSockets * maxRatio
 	}
 }
 
 func (c *VMController) setupMemoryHotplug(vmi *virtv1.VirtualMachineInstance, maxRatio uint32) {
-	if vmi.Spec.Domain.Memory == nil {
+	if vmi.Spec.Domain.Memory.MaxGuest != nil {
 		return
 	}
 
-	if vmi.Spec.Domain.Memory.MaxGuest == nil {
-		vmi.Spec.Domain.Memory.MaxGuest = c.clusterConfig.GetMaximumGuestMemory()
+	var maxGuest *resource.Quantity
+	switch {
+	case c.clusterConfig.GetMaximumGuestMemory() != nil:
+		maxGuest = c.clusterConfig.GetMaximumGuestMemory()
+	case vmi.Spec.Domain.Memory.Guest != nil:
+		maxGuest = resource.NewQuantity(vmi.Spec.Domain.Memory.Guest.Value()*int64(maxRatio), resource.BinarySI)
 	}
 
-	if vmi.Spec.Domain.Memory.MaxGuest == nil {
-		vmi.Spec.Domain.Memory.MaxGuest = resource.NewQuantity(vmi.Spec.Domain.Memory.Guest.Value()*int64(maxRatio), resource.BinarySI)
+	if err := memory.ValidateLiveUpdateMemory(&vmi.Spec, maxGuest); err != nil {
+		// memory hotplug is not compatible with this VM configuration
+		log.Log.V(2).Object(vmi).Infof("memory-hotplug disabled: %s", err)
+		return
 	}
+
+	vmi.Spec.Domain.Memory.MaxGuest = maxGuest
 }
 
 // filterActiveVMIs takes a list of VMIs and returns all VMIs which are not in a final state
@@ -2434,7 +2454,11 @@ func (c *VMController) updateStatus(vm, vmOrig *virtv1.VirtualMachine, vmi *virt
 	vm.Status.Ready = ready
 
 	runStrategy, _ := vmOrig.RunStrategy()
-	vm.Status.RunStrategy = runStrategy
+	// sync for the first time only when the VMI gets created
+	// so that we can tell if the VM got started at least once
+	if vm.Status.RunStrategy != "" || vm.Status.Created {
+		vm.Status.RunStrategy = runStrategy
+	}
 
 	c.trimDoneVolumeRequests(vm)
 	c.updateMemoryDumpRequest(vm, vmi)
@@ -3006,7 +3030,11 @@ func (c *VMController) addRestartRequiredIfNeeded(lastSeenVMSpec *virtv1.Virtual
 		if lastSeenVMSpec.Template.Spec.Domain.CPU != nil && vm.Spec.Template.Spec.Domain.CPU != nil {
 			lastSeenVMSpec.Template.Spec.Domain.CPU.Sockets = vm.Spec.Template.Spec.Domain.CPU.Sockets
 		}
-		if lastSeenVMSpec.Template.Spec.Domain.Memory != nil && vm.Spec.Template.Spec.Domain.Memory != nil {
+
+		if vm.Spec.Template.Spec.Domain.Memory != nil && vm.Spec.Template.Spec.Domain.Memory.Guest != nil {
+			if lastSeenVMSpec.Template.Spec.Domain.Memory == nil {
+				lastSeenVMSpec.Template.Spec.Domain.Memory = &virtv1.Memory{}
+			}
 			lastSeenVMSpec.Template.Spec.Domain.Memory.Guest = vm.Spec.Template.Spec.Domain.Memory.Guest
 		}
 		lastSeenVMSpec.Template.Spec.NodeSelector = vm.Spec.Template.Spec.NodeSelector
@@ -3260,19 +3288,43 @@ func (c *VMController) handleMemoryHotplugRequest(vm *virtv1.VirtualMachine, vmi
 		return nil
 	}
 
-	if vm.Spec.Template.Spec.Domain.Memory == nil || vmi.Spec.Domain.Memory == nil {
-		return nil
-	}
-
-	guestMemory := vmi.Spec.Domain.Memory.Guest
-
-	if vmi.Status.Memory == nil ||
-		vmi.Status.Memory.GuestCurrent == nil ||
-		vm.Spec.Template.Spec.Domain.Memory.Guest.Equal(*guestMemory) {
+	if vm.Spec.Template.Spec.Domain.Memory == nil ||
+		vm.Spec.Template.Spec.Domain.Memory.Guest == nil ||
+		vmi.Spec.Domain.Memory == nil ||
+		vmi.Spec.Domain.Memory.Guest == nil ||
+		vmi.Status.Memory == nil ||
+		vmi.Status.Memory.GuestCurrent == nil {
 		return nil
 	}
 
 	conditionManager := controller.NewVirtualMachineInstanceConditionManager()
+
+	if conditionManager.HasConditionWithStatus(vmi, virtv1.VirtualMachineInstanceMemoryChange, k8score.ConditionFalse) {
+		vmConditions := controller.NewVirtualMachineConditionManager()
+		vmConditions.UpdateCondition(vm, &virtv1.VirtualMachineCondition{
+			Type:               virtv1.VirtualMachineRestartRequired,
+			LastTransitionTime: metav1.Now(),
+			Status:             k8score.ConditionTrue,
+			Message:            "memory updated in template spec. Memory-hotplug failed and is not available for this VM configuration",
+		})
+		return nil
+	}
+
+	if vm.Spec.Template.Spec.Domain.Memory.Guest.Equal(*vmi.Spec.Domain.Memory.Guest) {
+		return nil
+	}
+
+	if vmi.Spec.Domain.Memory.MaxGuest == nil {
+		vmConditions := controller.NewVirtualMachineConditionManager()
+		vmConditions.UpdateCondition(vm, &virtv1.VirtualMachineCondition{
+			Type:               virtv1.VirtualMachineRestartRequired,
+			LastTransitionTime: metav1.Now(),
+			Status:             k8score.ConditionTrue,
+			Message:            "memory updated in template spec. Memory-hotplug is not available for this VM configuration",
+		})
+		return nil
+	}
+
 	if conditionManager.HasConditionWithStatus(vmi,
 		virtv1.VirtualMachineInstanceMemoryChange, k8score.ConditionTrue) {
 		return fmt.Errorf("another memory hotplug is in progress")
@@ -3280,6 +3332,17 @@ func (c *VMController) handleMemoryHotplugRequest(vm *virtv1.VirtualMachine, vmi
 
 	if migrations.IsMigrating(vmi) {
 		return fmt.Errorf("memory hotplug is not allowed while VMI is migrating")
+	}
+
+	if err := memory.ValidateLiveUpdateMemory(&vm.Spec.Template.Spec, vmi.Spec.Domain.Memory.MaxGuest); err != nil {
+		vmConditions := controller.NewVirtualMachineConditionManager()
+		vmConditions.UpdateCondition(vm, &virtv1.VirtualMachineCondition{
+			Type:               virtv1.VirtualMachineRestartRequired,
+			LastTransitionTime: metav1.Now(),
+			Status:             k8score.ConditionTrue,
+			Message:            fmt.Sprintf("memory hotplug not supported, %s", err.Error()),
+		})
+		return nil
 	}
 
 	if vm.Spec.Template.Spec.Domain.Memory.Guest != nil && vmi.Status.Memory.GuestAtBoot != nil &&
@@ -3388,22 +3451,35 @@ func (c *VMController) vmiInterfacesPatch(newVmiSpec *virtv1.VirtualMachineInsta
 	return err
 }
 
-func (c *VMController) setupHotplug(vmi, VMIDefaults *virtv1.VirtualMachineInstance) {
+func setGuestMemory(spec *virtv1.VirtualMachineInstanceSpec) {
+	if spec.Domain.Memory != nil &&
+		spec.Domain.Memory.Guest != nil {
+		return
+	}
+
+	switch {
+	case !spec.Domain.Resources.Requests.Memory().IsZero():
+		spec.Domain.Memory = &virtv1.Memory{
+			Guest: spec.Domain.Resources.Requests.Memory(),
+		}
+	case !spec.Domain.Resources.Limits.Memory().IsZero():
+		spec.Domain.Memory = &virtv1.Memory{
+			Guest: spec.Domain.Resources.Limits.Memory(),
+		}
+	case spec.Domain.Memory != nil && spec.Domain.Memory.Hugepages != nil:
+		if hugepagesSize, err := resource.ParseQuantity(spec.Domain.Memory.Hugepages.PageSize); err == nil {
+			spec.Domain.Memory.Guest = &hugepagesSize
+		}
+	}
+
+}
+
+func (c *VMController) setupHotplug(vmi *virtv1.VirtualMachineInstance) {
 	if !c.clusterConfig.IsVMRolloutStrategyLiveUpdate() {
 		return
 	}
 
 	maxRatio := c.clusterConfig.GetMaxHotplugRatio()
-
-	c.setupCPUHotplug(vmi, VMIDefaults, maxRatio)
+	c.setupCPUHotplug(vmi, maxRatio)
 	c.setupMemoryHotplug(vmi, maxRatio)
-}
-
-func (c *VMController) patchVMITerminationGracePeriod(gracePeriod *int64, vmi *virtv1.VirtualMachineInstance) error {
-	if gracePeriod == nil {
-		return nil
-	}
-	patch := fmt.Sprintf(`{"spec":{"terminationGracePeriodSeconds": %d }}`, *gracePeriod)
-	_, err := c.clientset.VirtualMachineInstance(vmi.Namespace).Patch(context.Background(), vmi.Name, types.MergePatchType, []byte(patch), v1.PatchOptions{})
-	return err
 }
