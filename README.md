@@ -69,9 +69,9 @@ To fast deploy KubeVirt with Kube-DTN support, you can use the following command
 
 ```bash
 export DOCKER_PREFIX=harbor.sail.se.sjtu.edu.cn/kubevirt
-export DOCKER_TAG=kubedtn-0.3
+export DOCKER_TAG=kubedtn-0.x
 # Build Kubevirt
-make all
+make && make push && make manifests
 # Deploy KubeVirt
 make up
 # Undeploy KubeVirt
